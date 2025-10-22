@@ -17,6 +17,15 @@ from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 # Camera & control settings
 load_dotenv()
 
+# Keep Hugging Face caches local to the project to avoid permission issues.
+from pathlib import Path
+
+HF_CACHE_BASE = Path(__file__).resolve().parents[2] / ".hf_cache"
+os.environ.setdefault("HF_HOME", str(HF_CACHE_BASE))
+os.environ.setdefault("HF_HUB_CACHE", str(HF_CACHE_BASE / "hub"))
+os.environ.setdefault("HF_MODULES_CACHE", str(HF_CACHE_BASE / "modules"))
+os.environ.setdefault("TRANSFORMERS_DYNAMIC_MODULES_CACHE", str(HF_CACHE_BASE / "modules"))
+
 CAM_URLS = [
     "http://192.168.4.1:8765/",
     "http://192.168.4.1:9000/mjpg",
@@ -29,7 +38,7 @@ FRAME_RESIZE = (320, 240)
 SLEEP_SECONDS = 0.05  # Keep <80 ms to hold MODE_APP_CONTROL
 WARMUP_SECONDS = 5.0
 ENABLE_PREVIEW = True
-ENABLE_MASK_VIEW = True
+ENABLE_MASK_VIEW = False
 LOG_LEVEL = logging.INFO
 LOG_EVERY_N = 10
 
