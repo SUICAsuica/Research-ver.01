@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -27,19 +28,19 @@ os.environ.setdefault("HF_MODULES_CACHE", str(HF_CACHE_BASE / "modules"))
 os.environ.setdefault("TRANSFORMERS_DYNAMIC_MODULES_CACHE", str(HF_CACHE_BASE / "modules"))
 
 CAM_URLS = [
-    "http://192.168.4.1:8765/",
     "http://192.168.4.1:9000/mjpg",
-    "http://192.168.4.1:9000/?action=stream",
 ]
 WS_URL = "ws://192.168.4.1:8765/"
 REGION_COUNT = 26  # Fields A..Z
-JOYSTICK_REGION_INDEX = 10  # REGION_K
+JOYSTICK_REGION = 10  # REGION_K
+HEAD_JOYSTICK_REGION = 16  # REGION_Q (pan/tilt stick stays centered)
+MANUAL_MODE_REGION = 12  # REGION_M toggles app-control mode
 FRAME_RESIZE = (320, 240)
 SLEEP_SECONDS = 0.05  # Keep <80 ms to hold MODE_APP_CONTROL
 WARMUP_SECONDS = 5.0
 ENABLE_PREVIEW = True
 ENABLE_MASK_VIEW = False
-LOG_LEVEL = logging.INFO
+LOG_LEVEL = logging.DEBUG
 LOG_EVERY_N = 10
 
 # Local VLM (smolVLM) settings
@@ -54,15 +55,25 @@ SMOL_MAX_NEW_TOKENS = int(os.getenv("SMOL_MAX_NEW_TOKENS", "128"))
 SMOL_TEMPERATURE = float(os.getenv("SMOL_TEMPERATURE", "0.0"))
 SMOL_SYSTEM_PROMPT = os.getenv(
     "SMOL_SYSTEM_PROMPT",
-    "You are a precise perception module for a robot car. Always answer in JSON.",
+    (
+        "You are the perception core for a mobile robot. "
+        "Always respond with strict JSON that matches the requested schema. "
+        "If the white target rectangle is not visible or you are uncertain, "
+        "set present=false and return 0 for all numeric values."
+    ),
 )
 SMOL_USER_PROMPT = os.getenv(
     "SMOL_USER_PROMPT",
     (
-        "Detect the primary white rectangular box (the car's target) in this image. "
-        "Return a JSON object with fields: present (boolean), confidence (0-1), "
-        "center_x, center_y, box_width, box_height (all 0-1 ratios of image width/height). "
-        "If the box is missing, respond with present=false, confidence=0, and set the other values to 0."
+        "Analyze the robot camera image and locate the white rectangular target (bright interior, dark border). "
+        "Return JSON with fields: present (boolean), confidence (0-1), center_x, center_y, "
+        "box_width, box_height (all normalized 0-1 relative to image width/height). "
+        "Only use present=true when you can supply non-zero box_width and box_height and confidence >= 0.1. "
+        "Example when visible: "
+        '{"present": true, "confidence": 0.82, "center_x": 0.51, "center_y": 0.47, "box_width": 0.34, "box_height": 0.25}. '
+        "Example when absent: "
+        '{"present": false, "confidence": 0.0, "center_x": 0.0, "center_y": 0.0, "box_width": 0.0, "box_height": 0.0}. '
+        "If the rectangle is missing or ambiguous, reuse the absent example exactly."
     ),
 )
 VLM_INTERVAL_FRAMES = 10  # How often to refresh detection
@@ -70,6 +81,11 @@ VLM_MAX_AGE_SECONDS = 3.0  # Drop stale detections
 STOP_AREA_THRESHOLD = 0.12  # Fraction of frame covered before stopping
 TURN_GAIN = 90.0
 MAX_FORWARD_SPEED = 80.0
+MIN_FORWARD_SPEED = 50  # Minimum joystick throttle once we decide to drive forward
+HANDSHAKE_TIMEOUT = float(os.getenv("HANDSHAKE_TIMEOUT", "5.0"))
+HANDSHAKE_CHECK = os.getenv("HANDSHAKE_CHECK", "SC")
+HANDSHAKE_NAME = os.getenv("HANDSHAKE_NAME", "PC")
+HANDSHAKE_TYPE = os.getenv("HANDSHAKE_TYPE", "Blank")
 
 
 @dataclass
@@ -86,8 +102,17 @@ class BoxDetection:
 
 
 def build_payload(x: int, y: int) -> str:
+    xi = int(np.clip(x, -100, 100))
+    yi = int(np.clip(y, -100, 100))
+
     fields = ["0"] * REGION_COUNT
-    fields[JOYSTICK_REGION_INDEX] = f"{x},{y}"
+    # Leave the mode-select switches (REGION_M..REGION_P) untouched so the UNO
+    # firmware stays in MODE_APP_CONTROL. Setting them high flips the car into
+    # autonomous scripts and ignores joystick data.
+    fields[JOYSTICK_REGION] = f"{xi},{yi}"
+    # Keep the second joystick (REGION_Q) centered so the ESP32 firmware
+    # doesn't reuse stale head/tilt values from earlier sessions.
+    fields[HEAD_JOYSTICK_REGION] = "0,0"
     return "WS+" + ";".join(fields) + "\n"
 
 
@@ -149,12 +174,15 @@ class SmolVLMDetector:
                 max_tokens=self.max_new_tokens,
                 verbose=False,
             )
+            text_attr = getattr(result, "text", None)
+            logging.debug("smolVLM response: %r", text_attr)
         except Exception as exc:
             logging.warning("smolVLM generation failed: %s", exc)
             return None
 
-        text = getattr(result, "text", "") if result else ""
+        text = text_attr or ""
         if not text:
+            logging.debug("smolVLM returned empty text.")
             return None
 
         data = parse_detection_json(text)
@@ -162,21 +190,24 @@ class SmolVLMDetector:
             logging.debug("smolVLM raw output (unparsed): %s", text.strip())
             return None
         if not data.get("present"):
-            return None
-
-        try:
-            width_ratio = clamp01(float(data.get("box_width", 0.0)))
-            height_ratio = clamp01(float(data.get("box_height", 0.0)))
-        except (TypeError, ValueError):
-            return None
-
-        if width_ratio == 0 or height_ratio == 0:
+            logging.debug("smolVLM indicates target absent.")
             return None
 
         try:
             confidence = clamp01(float(data.get("confidence", 0.0)))
         except (TypeError, ValueError):
             confidence = 0.0
+
+        try:
+            width_ratio = clamp01(float(data.get("box_width", 0.0)))
+            height_ratio = clamp01(float(data.get("box_height", 0.0)))
+        except (TypeError, ValueError):
+            logging.debug("smolVLM returned invalid box dimensions: %s", data)
+            return None
+
+        if width_ratio <= 0.0 or height_ratio <= 0.0 or confidence <= 0.0:
+            logging.debug("Discarding zero-sized or zero-confidence detection: %s", data)
+            return None
 
         try:
             center_x = clamp01(float(data.get("center_x", 0.5)))
@@ -261,8 +292,87 @@ def decide_command(frame: np.ndarray, detection: Optional[BoxDetection]) -> Tupl
     forward_scale = max(0.0, min(1.0, (STOP_AREA_THRESHOLD - area_ratio) / STOP_AREA_THRESHOLD))
 
     x_cmd = int(np.clip(dx * TURN_GAIN, -100, 100))
-    y_cmd = int(np.clip(forward_scale * MAX_FORWARD_SPEED, 0, 100))
+    raw_forward = forward_scale * MAX_FORWARD_SPEED
+    if raw_forward <= 0.0:
+        y_cmd = 0
+    else:
+        y_cmd = int(np.clip(max(raw_forward, MIN_FORWARD_SPEED), 0, 100))
     return x_cmd, y_cmd, detection, mask
+
+
+def build_handshake_payload(template: Optional[dict] = None) -> str:
+    """Return the SunFounder controller greeting with fixed identity."""
+
+    data = template.copy() if template else {}
+    data.update(
+        {
+            "Check": HANDSHAKE_CHECK,
+            "Name": HANDSHAKE_NAME,
+            "Type": HANDSHAKE_TYPE,
+        }
+    )
+    return json.dumps(data)
+
+
+async def maybe_handle_check_frame(ws, text: str, send_lock: asyncio.Lock) -> bool:
+    cleaned = text.strip()
+    if not cleaned or not cleaned.startswith("{"):
+        return False
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return False
+    check_value = data.get("Check")
+    if not check_value:
+        return False
+    try:
+        payload = build_handshake_payload(data)
+        async with send_lock:
+            await ws.send(payload)
+        logging.info(
+            "Responded to Check=%s with payload %s",
+            check_value,
+            payload,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logging.warning("Failed to send handshake Ack: %s", exc)
+        return False
+    return True
+
+
+async def wait_for_handshake(ws, send_lock: asyncio.Lock) -> None:
+    logging.info("Waiting for ESP32 handshake...")
+    start = time.time()
+    while True:
+        timeout = HANDSHAKE_TIMEOUT - (time.time() - start)
+        if timeout <= 0:
+            raise TimeoutError("Timed out waiting for ESP32 handshake response")
+        try:
+            message = await asyncio.wait_for(ws.recv(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError("Timed out waiting for ESP32 handshake message") from exc
+        if isinstance(message, bytes):
+            continue
+        text = message.strip()
+        if not text or text == "null" or text.startswith("pong"):
+            continue
+        logging.debug("WS recv text: %s", text)
+        if await maybe_handle_check_frame(ws, text, send_lock):
+            logging.info("ESP32 handshake complete")
+            return
+
+
+async def consume_server_messages(ws, send_lock: asyncio.Lock) -> None:
+    try:
+        async for message in ws:
+            if isinstance(message, bytes):
+                continue
+            text = message.strip()
+            if not text or text == "null" or text.startswith("pong"):
+                continue
+            await maybe_handle_check_frame(ws, text, send_lock)
+    except (ConnectionClosedError, ConnectionClosedOK, TimeoutError):
+        pass
 
 
 async def control_loop() -> None:
@@ -304,76 +414,92 @@ async def control_loop() -> None:
             try:
                 async with websockets.connect(WS_URL, ping_interval=10, ping_timeout=10) as ws:
                     logging.info("WebSocket connected: %s", WS_URL)
+                    send_lock = asyncio.Lock()
+                    try:
+                        await wait_for_handshake(ws, send_lock)
+                    except TimeoutError as exc:
+                        logging.error("Handshake with ESP32 failed: %s", exc)
+                        await asyncio.sleep(reconnect_delay)
+                        continue
+                    receiver_task = asyncio.create_task(consume_server_messages(ws, send_lock))
                     frame_count = 0
-                    while running:
-                        ok, frame = cap.read()
-                        if not ok:
-                            await asyncio.sleep(SLEEP_SECONDS)
-                            continue
+                    try:
+                        while running:
+                            ok, frame = cap.read()
+                            if not ok:
+                                await asyncio.sleep(SLEEP_SECONDS)
+                                continue
 
-                        frame = cv2.resize(frame, FRAME_RESIZE)
-                        frame_count += 1
-                        now = time.time()
+                            frame = cv2.resize(frame, FRAME_RESIZE)
+                            frame_count += 1
+                            now = time.time()
 
-                        if last_detection is not None and (now - last_detection_time) > VLM_MAX_AGE_SECONDS:
-                            last_detection = None
+                            if last_detection is not None and (now - last_detection_time) > VLM_MAX_AGE_SECONDS:
+                                last_detection = None
 
-                        if vlm_task and vlm_task.done():
-                            try:
-                                result = vlm_task.result()
-                            except Exception as exc:
-                                logging.warning("VLM task failed: %s", exc)
-                                result = None
-                            last_detection = result
-                            last_detection_time = time.time()
-                            vlm_task = None
+                            if vlm_task and vlm_task.done():
+                                try:
+                                    result = vlm_task.result()
+                                except Exception as exc:
+                                    logging.warning("VLM task failed: %s", exc)
+                                    result = None
+                                last_detection = result
+                                last_detection_time = time.time()
+                                vlm_task = None
 
-                        should_launch_vlm = (
-                            vlm_task is None
-                            and (
-                                last_detection is None
-                                or frame_count % VLM_INTERVAL_FRAMES == 0
-                            )
-                        )
-
-                        if should_launch_vlm:
-                            frame_for_vlm = frame.copy()
-                            vlm_task = asyncio.create_task(
-                                asyncio.to_thread(run_vlm_inference, frame_for_vlm)
-                            )
-
-                        x_cmd, y_cmd, detection, mask = decide_command(frame, last_detection)
-
-                        if frame_count % LOG_EVERY_N == 0:
-                            if detection:
-                                logging.info(
-                                    "cmd=(%d,%d) center=%s area=%.3f conf=%.2f",
-                                    x_cmd,
-                                    y_cmd,
-                                    detection.center,
-                                    detection.area_ratio,
-                                    detection.confidence,
+                            should_launch_vlm = (
+                                vlm_task is None
+                                and (
+                                    last_detection is None
+                                    or frame_count % VLM_INTERVAL_FRAMES == 0
                                 )
-                            else:
-                                logging.info("cmd=(%d,%d) no target", x_cmd, y_cmd)
+                            )
 
-                        if ENABLE_PREVIEW:
-                            preview = frame.copy()
-                            draw_detection(preview, detection)
-                            cv2.imshow("preview", preview)
-                            if ENABLE_MASK_VIEW:
-                                cv2.imshow("mask", mask)
-                            if cv2.waitKey(1) & 0xFF == 27:
-                                running = False
+                            if should_launch_vlm:
+                                frame_for_vlm = frame.copy()
+                                vlm_task = asyncio.create_task(
+                                    asyncio.to_thread(run_vlm_inference, frame_for_vlm)
+                                )
+
+                            x_cmd, y_cmd, detection, mask = decide_command(frame, last_detection)
+
+                            if frame_count % LOG_EVERY_N == 0:
+                                if detection:
+                                    logging.info(
+                                        "cmd=(%d,%d) center=%s area=%.3f conf=%.2f",
+                                        x_cmd,
+                                        y_cmd,
+                                        detection.center,
+                                        detection.area_ratio,
+                                        detection.confidence,
+                                    )
+                                else:
+                                    logging.info("cmd=(%d,%d) no target", x_cmd, y_cmd)
+
+                            if ENABLE_PREVIEW:
+                                preview = frame.copy()
+                                draw_detection(preview, detection)
+                                cv2.imshow("preview", preview)
+                                if ENABLE_MASK_VIEW:
+                                    cv2.imshow("mask", mask)
+                                if cv2.waitKey(1) & 0xFF == 27:
+                                    running = False
+                                    break
+
+                            try:
+                                payload = build_payload(x_cmd, y_cmd)
+                                logging.debug("WS payload -> %s", payload.strip())
+                                async with send_lock:
+                                    await ws.send(payload)
+                            except (ConnectionClosedError, ConnectionClosedOK, TimeoutError) as exc:
+                                logging.warning("WebSocket send failed: %s", exc)
                                 break
 
-                        try:
-                            await ws.send(build_payload(x_cmd, y_cmd))
-                        except (ConnectionClosedError, ConnectionClosedOK, TimeoutError) as exc:
-                            logging.warning("WebSocket send failed: %s", exc)
-                            break
-
-                        await asyncio.sleep(SLEEP_SECONDS)
+                            await asyncio.sleep(SLEEP_SECONDS)
+                    finally:
+                        receiver_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await receiver_task
             except (ConnectionClosedError, ConnectionClosedOK, TimeoutError) as exc:
                 logging.warning("WebSocket connection closed: %s", exc)
             except Exception as exc:
